@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>星尘遗迹</title>
+  <link rel="stylesheet" href="./css/style.css" />
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+  <div id="fx-vignette" aria-hidden="true"></div>
+  <div id="boot-preload" aria-live="polite">薄雾集结中…</div>
+
+  <script type="module">
+import * as THREE from 'three';
+import { createWorld } from './js/world.js';
+import { createPlayer } from './js/player.js';
+import { createShardField } from './js/shards.js';
+import { createGameSystems } from './js/systems.js';
+import { createInteract, createSummitPads } from './js/interact.js';
+import { createLore } from './js/lore.js';
+import { createGate } from './js/gate.js';
+import { createAudio } from './js/audio.js';
+import { createUI } from './js/ui.js';
+import { createPostFX } from './js/postfx.js';
+import { createLandmarks } from './js/landmarks.js';
+
+const TOTAL = 9;
+const COLLECT_RADIUS = 1.75;
+const SAVE_POSE_EVERY = 4;
+
+const canvas = document.getElementById('game-canvas');
+const audio = createAudio();
+const ui = createUI({ total: TOTAL });
+const systems = createGameSystems({ TOTAL });
+
+let playing = false;
+let won = false;
+let poseSaveAcc = 0;
+let lastHint = null;
+let lastToastHintAt = 0;
+
+// ── Renderer ──────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  antialias: true,
+  powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 260);
+camera.position.set(0, 2.2, 18);
+
+const hemi = new THREE.HemisphereLight(0x9ec9ff, 0x1a2a1f, 0.55);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffe2b0, 1.35);
+sun.position.set(-22, 32, 14);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 2;
+sun.shadow.camera.far = 100;
+sun.shadow.camera.left = -50;
+sun.shadow.camera.right = 50;
+sun.shadow.camera.top = 50;
+sun.shadow.camera.bottom = -50;
+sun.shadow.bias = -0.00025;
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x6aa8ff, 0.28);
+fill.position.set(24, 12, -14);
+scene.add(fill);
+
+// ── PostFX (gentle bloom + vignette; falls back if addons blocked) ──
+const postfx = createPostFX(renderer, scene, camera);
+
+// ── World / lore / gate / player / shards ─────────────────────────────
+const world = createWorld(THREE, scene);
+const islandRadius = world.walkRadius ?? world.islandRadius ?? 34;
+
+const lore = createLore(THREE, scene);
+const gate = createGate(THREE, scene, { x: 0, z: 11, name: 'soft-gate', tag: 'soft-gate' });
+/** Second soft-gate: courtyard → summit path; opens at 6 shards. */
+const summitGate = createGate(THREE, scene, {
+  x: 0,
+  z: -10.5,
+  width: 6.5,
+  closedRadius: 4.8,
+  name: 'summit-soft-gate',
+  tag: 'summit-soft-gate',
+});
+
+// Soft-gate + lore tablet colliders share the world.blockers array
+if (Array.isArray(world.blockers)) {
+  if (gate.blockers) world.blockers.push(...gate.blockers);
+  if (summitGate.blockers) world.blockers.push(...summitGate.blockers);
+  if (lore.blockers) world.blockers.push(...lore.blockers);
+}
+
+const player = createPlayer({
+  THREE,
+  scene,
+  camera,
+  canvas,
+  blockers: world.blockers,
+  islandRadius,
+});
+
+const shardField = createShardField(THREE, scene, world.shardAnchors);
+
+const interact = createInteract({
+  getState: () => systems.state,
+});
+
+/** Optional summit flavour pads (NOT a win gate). */
+const summitPads = createSummitPads(THREE, scene);
+
+/** Interact landmarks + 苔径回廊 colonnade (meshes for E-points). */
+const landmarks = createLandmarks(THREE, scene);
+if (Array.isArray(world.blockers) && landmarks.blockers) {
+  world.blockers.push(...landmarks.blockers);
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────
+function setInteractHint(text) {
+  if (typeof ui.setInteractHint === 'function') {
+    // ui.setInteractHint already toggles setCrosshairMode('interact'|'default')
+    ui.setInteractHint(text || null);
+    lastHint = text || null;
+    return;
+  }
+  // Fallback: rare toast when prompt appears (no spam on leave)
+  if (text && text !== lastHint) {
+    const now = performance.now();
+    if (now - lastToastHintAt > 2200) {
+      ui.showToast(text, { ms: 1600 });
+      lastToastHintAt = now;
+    }
+  }
+  lastHint = text || null;
+}
+
+function syncJournalUI() {
+  const steps = systems.quests.map((q) => ({
+    id: q.id,
+    text: (q.optional ? '（可选）' : '') + q.title,
+    done: typeof q.isDone === 'function' ? q.isDone(systems.state) : false,
+  }));
+  ui.setJournalSteps(steps);
+}
+
+function zoneAt(pos) {
+  const zones = world.zones || [];
+  let best = null;
+  let bestD = Infinity;
+  for (const z of zones) {
+    const cx = z.center?.x ?? z.cx ?? 0;
+    const cz = z.center?.z ?? z.cz ?? 0;
+    const d = Math.hypot(pos.x - cx, pos.z - cz);
+    if (d < (z.radius ?? z.r ?? 12) && d < bestD) {
+      bestD = d;
+      best = z;
+    }
+  }
+  return best;
+}
+
+function restoreLoreFromFlags() {
+  const ids = new Set(systems.state.loreReads || []);
+  if (systems.state.flags.harbor_stele) ids.add('harbor-tablet');
+  if (systems.state.flags.courtyard_stele) ids.add('courtyard-tablet');
+  if (systems.state.flags.lore_summit) ids.add('summit-tablet');
+  if (systems.state.flags.lore_gate) ids.add('gate-tablet');
+  if (typeof lore.applyReadIds === 'function') lore.applyReadIds([...ids]);
+  else lore.resetReads?.();
+}
+
+function syncGates({ announce = false } = {}) {
+  const fogShould = systems.state.collected >= 3;
+  const fogWas = gate.isOpen();
+  gate.setOpen(fogShould);
+  if (announce && fogShould && !fogWas) {
+    ui.showToast('雾廊软门已开启 —— 庭院之路畅通', { gold: true, ms: 2400 });
+  }
+
+  const sumShould = systems.state.collected >= 6;
+  const sumWas = summitGate.isOpen();
+  summitGate.setOpen(sumShould);
+  if (announce && sumShould && !sumWas) {
+    ui.showToast('高台纱障已退 —— 星井之路畅通', { gold: true, ms: 2400 });
+  }
+}
+
+function applyTakenShards() {
+  const taken = new Set(systems.state.taken);
+  for (const s of shardField.shards) {
+    const idx = s.userData.index;
+    if (taken.has(idx)) {
+      s.userData.taken = true;
+      s.visible = false;
+      if (s.userData.light) s.userData.light.intensity = 0;
+    } else {
+      s.userData.taken = false;
+      s.visible = true;
+    }
+  }
+  const p = systems.state.collected / TOTAL;
+  // Portal visual fills with shards; full glow reserved for lighting win
+  const visual = systems.state.won ? 1 : Math.min(0.92, p);
+  world.setPortalPower(visual);
+  postfx.setPortalBloom?.(visual);
+  ui.updateShardCount(systems.state.collected, TOTAL);
+  syncJournalUI();
+}
+
+function persistPose() {
+  if (!playing || won) return;
+  systems.setPlayerPose(player.getPose());
+  if (typeof systems.setLoreReads === 'function' && lore.getReadIds) {
+    systems.setLoreReads(lore.getReadIds());
+  }
+  systems.save();
+}
+
+function hasSave() {
+  try {
+    return !!localStorage.getItem('aether-ruins-save-v1');
+  } catch {
+    return false;
+  }
+}
+
+
+function syncLanternLandmarks() {
+  const f = systems.state.flags || {};
+  for (const id of ['lantern_harbor', 'lantern_court', 'lantern_summit']) {
+    landmarks.setLit?.(id, !!f[id]);
+  }
+}
+
+function beginPlay({ resume = false } = {}) {
+  audio.resume();
+  audio.playClick();
+  ui.hideStart();
+  ui.hideEnd();
+  setInteractHint(null);
+  ui.hideResumeHint?.();
+
+  if (resume) {
+    systems.load();
+    applyTakenShards();
+    restoreLoreFromFlags();
+    syncLanternLandmarks();
+    syncGates({ announce: false });
+    summitPads.setCompleted(!!systems.state.flags.star_align);
+    if (systems.state.player) {
+      player.reset({
+        x: systems.state.player.x,
+        y: 2.2,
+        z: systems.state.player.z,
+        yaw: systems.state.player.yaw,
+      });
+    } else {
+      player.reset({ x: 0, y: 2.2, z: 18 });
+    }
+    if (systems.state.won) {
+      won = true;
+      playing = false;
+      player.unlock();
+      world.setPortalPower(1);
+      postfx.setPortalBloom?.(1);
+      audio.startPad();
+      audio.playWin();
+      ui.showEnd({ collected: systems.state.collected });
+      syncJournalUI();
+      return;
+    }
+  } else {
+    systems.reset();
+    lore.resetReads?.();
+    applyTakenShards();
+    syncGates({ announce: false });
+    summitPads.setCompleted(false);
+    summitPads.resetAttempt();
+    syncLanternLandmarks();
+    player.reset({ x: 0, y: 2.2, z: 18 });
+  }
+
+  won = false;
+  playing = true;
+  poseSaveAcc = 0;
+  echoRangeReadyAt = 0;
+  silentSitPending = false;
+  ui.showHud();
+  ui.setMuteLabel(audio.isMuted());
+  syncJournalUI();
+  const z = zoneAt(player.getPosition());
+  ui.setZoneName(z?.name || '晨雾港湾');
+  audio.startPad();
+  player.lock();
+  ui.showToast(resume ? '继续探索遗迹…' : '指针锁定 · E 交互 · Esc 释放', { ms: 2000 });
+  // First-visit zone toast (harbor on new game); skipped if flag already saved
+  const startZ = zoneAt(player.getPosition());
+  if (startZ?.id) {
+    const entered = systems.onZoneEnter?.(startZ.id);
+    if (entered?.toast) {
+      setTimeout(() => ui.showToast(entered.toast, { ms: 2600 }), resume ? 400 : 2100);
+    }
+  }
+}
+
+function doWin() {
+  if (won) return;
+  // systems.state.won must already be set via onPortalLight
+  if (!systems.state.won) return;
+  won = true;
+  playing = false;
+  setInteractHint(null);
+  ui.hideResumeHint?.();
+  if (typeof systems.setLoreReads === 'function' && lore.getReadIds) {
+    systems.setLoreReads(lore.getReadIds());
+  }
+  systems.setPlayerPose(player.getPose());
+  systems.save();
+  world.setPortalPower(1);
+  postfx.setPortalBloom?.(1);
+  player.unlock();
+  ui.markJournal('portal', true);
+  syncJournalUI();
+  audio.playWin();
+  ui.showToast('星尘之门点亮 —— 归途已开', { gold: true, ms: 2800 });
+  setTimeout(() => {
+    ui.showEnd({ collected: systems.state.collected });
+  }, 900);
+}
+
+function tryCollect() {
+  if (!playing || won) return;
+  const pos = player.getPosition();
+  const idx = shardField.takeNearby(pos, COLLECT_RADIUS);
+  if (idx == null) return;
+
+  const z = zoneAt(pos);
+  const result = systems.onCollect(idx, z?.name);
+  applyTakenShards();
+  syncGates({ announce: true });
+  const n = systems.state.collected;
+  audio.playCollect(n);
+
+  if (n >= TOTAL) {
+    ui.showToast('九枚星尘归位 —— 前往岛心传送门，按 E 点亮', { gold: true, ms: 3200 });
+  } else if (result?.threshold === 3) {
+    ui.showToast(`拾取星尘（${n}/${TOTAL}）· 雾廊已开，可解读庭院铭文`);
+  } else if (result?.threshold === 6) {
+    ui.showToast(`拾取星尘（${n}/${TOTAL}）· 通往星井高台的雾纱已散`);
+  } else {
+    ui.showToast(`拾取星尘碎片（${n}/${TOTAL}）`);
+  }
+  if (result?.resonance) {
+    ui.showToast('星尘共鸣', { gold: true, ms: 1800 });
+  }
+  syncJournalUI();
+  persistPose();
+}
+
+const INTERACT_META = {
+  harbor_stele: {
+    journal: '你读完港湾铭石：潮声里藏着星屑的叹息——往北，残碑庭院在等你。',
+    toast: '港湾铭石已读 —— 开始收集星尘',
+  },
+  courtyard_stele: {
+    journal: '庭院残碑记着九道裂痕。中心拱门曾通向群星航线，等待完整共鸣。',
+    toast: '庭院铭文解读完毕 —— 可拼合残片纹路',
+  },
+  tide_step: {
+    journal: '你立在潮汐石阶上。潮水涨落间，岸缘一枚尚未拾取的星尘似在脉动应答。',
+    toast: '潮声入耳 —— 远处星尘短暂脉动',
+  },
+  stele_frag_a: {
+    journal: '残片一：石纹浮现半环。',
+    toast: '残片（一）嵌入',
+  },
+  stele_frag_b: {
+    journal: '残片二：裂痕对齐成弦。',
+    toast: '残片（二）嵌入',
+  },
+  stele_frag_c: {
+    journal: '残片三：末段纹路归位。',
+    toast: '残片（三）嵌入',
+  },
+  stele_join: {
+    journal: '三处残片共鸣，庭院石纹完整闭合——雾廊回音似更清晰。',
+    toast: '庭院纹路完整',
+  },
+  fog_echo: {
+    journal:
+      '雾廊回音石吐出潮声的叠影：西侧高台岩架附近，仍有一枚隐藏的星尘在低语——不必死记坐标，循雾北上即可。',
+    toast: '回音入耳 —— 日志记下隐藏碎片方位',
+  },
+  sunk_bell: {
+    journal: '沉钟敲响，回音穿过薄雾。日志记下雾廊与潮汐石阶的方位低语。',
+    toast: '沉钟回荡 —— 可选风味',
+  },
+  silver_shrine: {
+    journal: '你向银叶神龛献上碎片记忆。意识中闪过星轨：高台与庭院仍有遗珠。',
+    toast: '神龛接受献祭 —— 可选风味',
+  },
+  star_align: {
+    journal: '星井三踏印完成。井口微光一闪——风味记忆，并非通关所必需。',
+    toast: '三踏印共鸣 —— 星井记住了你的脚步',
+  },
+  void_rift: {
+    journal:
+      '你在岛缘凝视虚空裂隙：雾外仿佛有另一层夜空在缓慢旋转——只是观察，并非钥匙。',
+    toast: '虚空裂隙 —— 风味记忆已记入日志',
+  },
+  lantern_harbor: {
+    journal: '港湾提灯被你点亮，暖光在潮雾里漾开一圈。',
+    toast: '港湾提灯点亮',
+  },
+  lantern_court: {
+    journal: '庭院提灯点亮，石纹边缘多了一寸温柔的轮廓。',
+    toast: '庭院提灯点亮',
+  },
+  lantern_summit: {
+    journal: '高台提灯点亮，井口的冷光与暖焰短暂交汇。',
+    toast: '高台提灯点亮',
+  },
+  lanterns_all: {
+    journal: '雾薄了一寸。三盏提灯遥遥相望，岛径似乎更易辨认。',
+    toast: '三盏提灯俱亮 —— 雾薄了一寸',
+  },
+  echo_range: {
+    journal: '回声测距：雾声只肯给方位，不肯给坐标。',
+    toast: '回声测距 —— 日志记下大致方位',
+  },
+  silent_sit: {
+    journal: '你蹲坐静听两息。石纹间的风像有人轻数呼吸——并无钥匙，只有片刻安宁。',
+    toast: '静听两息 —— 庭院记住了你的静默',
+  },
+};
+
+/** Cardinal hint for echo ranging (+x 东, −x 西, +z 南, −z 北). */
+function cardinalOf(dx, dz) {
+  if (Math.abs(dx) >= Math.abs(dz)) return dx >= 0 ? '东' : '西';
+  return dz >= 0 ? '南' : '北';
+}
+
+/** Optional notebook toasts from systems.checkStardustNotes / onInteract.notes */
+function maybeNoteToasts(notes) {
+  if (!notes) return;
+  if (notes.note5) ui.showToast('星尘笔记·五 —— 可选足迹成册', { gold: true, ms: 2600 });
+  if (notes.note8) ui.showToast('星尘笔记·八 —— 可选足迹叠成笔记', { gold: true, ms: 2800 });
+}
+
+/** Echo-range cooldown (ms since epoch / performance). */
+let echoRangeReadyAt = 0;
+const ECHO_RANGE_CD_MS = 20000;
+
+/** Silent-sit: one-shot with 2s flavour delay before completion toast. */
+let silentSitPending = false;
+
+function tryInteractKey() {
+  if (!playing || won) return;
+  if (document.body.classList.contains('journal-open')) return;
+  if (!player.controls.isLocked) return;
+
+  const pos = player.getPosition();
+  const res = interact.tryInteract(pos);
+
+  if (!res.ok) {
+    if (res.reason === 'blocked' && res.message) {
+      ui.showToast(res.message, { ms: 1800 });
+      return;
+    }
+    // Flavour tablets (summit / gate) — optional E read via lore
+    const body = lore.tryRead?.(pos);
+    if (body) {
+      const title = body.split('\n')[0] || '铭文';
+      if (body.includes('星井碑记')) systems.state.flags.lore_summit = true;
+      if (body.includes('雾廊短笺')) systems.state.flags.lore_gate = true;
+      systems.pushJournal?.(`再读铭文：${title.replace(/【|】/g, '')}`);
+      if (typeof systems.setLoreReads === 'function' && lore.getReadIds) {
+        systems.setLoreReads(lore.getReadIds());
+      }
+      systems.save();
+      syncJournalUI();
+      ui.showToast(`${title.replace(/【|】/g, '')} · 低语入耳`, { ms: 2200 });
+    }
+    return;
+  }
+
+  const point = res.point;
+
+  if (point.id === 'portal') {
+    // Hard win condition: 9 shards + E at portal only. Rites are optional flavour.
+    if (systems.onPortalLight()) {
+      audio.playClick();
+      doWin();
+    } else {
+      ui.showToast(`需集齐九枚星尘（${systems.state.collected}/9）方可点亮`);
+    }
+    return;
+  }
+
+  // Mark lore tablet if linked
+  if (point.loreId) {
+    lore.tryRead?.(pos);
+  }
+
+  // ── Optional: echo ranging (cooldown 20s; journal cardinal only) ──
+  if (point.id === 'echo_range') {
+    const now = performance.now();
+    if (now < echoRangeReadyAt) {
+      const rem = Math.ceil((echoRangeReadyAt - now) / 1000);
+      ui.showToast(`回声未定 · 再等 ${rem} 息`, { ms: 1400 });
+      return;
+    }
+    echoRangeReadyAt = now + ECHO_RANGE_CD_MS;
+    const near = shardField.nearestUntaken?.(pos);
+    let journal;
+    let toast;
+    if (near) {
+      const dir = cardinalOf(near.dx, near.dz);
+      journal = `回声测距：最近未拾的星尘大致在你的${dir}方——雾声只肯给方位，不肯给坐标。`;
+      toast = `回声测距 —— 大致${dir}方`;
+    } else {
+      journal = '回声测距：四周已无未拾的星尘回响。';
+      toast = '回声测距 —— 四周已静';
+    }
+    audio.playClick();
+    if (!systems.hasFlag('echo_range')) {
+      const out = systems.onInteract('echo_range', { journal, toast });
+      maybeNoteToasts(out.notes);
+    } else {
+      systems.pushJournal?.(journal);
+      const notes = systems.checkStardustNotes?.();
+      systems.save();
+      maybeNoteToasts(notes);
+    }
+    ui.showToast(toast, { ms: 2400 });
+    syncJournalUI();
+    persistPose();
+    return;
+  }
+
+  // ── Optional: silent sit (one E; 2s flavour delay before toast) ──
+  if (point.id === 'silent_sit') {
+    if (systems.hasFlag('silent_sit') || silentSitPending) {
+      ui.showToast('已经静听过了', { ms: 1200 });
+      return;
+    }
+    silentSitPending = true;
+    audio.playClick();
+    ui.showToast('静听中…', { ms: 1800 });
+    const meta = INTERACT_META.silent_sit;
+    setTimeout(() => {
+      silentSitPending = false;
+      if (systems.hasFlag('silent_sit')) return;
+      const out = systems.onInteract('silent_sit', meta);
+      if (out.ok) {
+        ui.showToast(meta.toast, { gold: true, ms: 2600 });
+        maybeNoteToasts(out.notes);
+        syncJournalUI();
+        persistPose();
+      }
+    }, 2000);
+    return;
+  }
+
+  const meta = INTERACT_META[point.id] || {
+    journal: `完成交互：${point.label}`,
+    toast: point.label,
+  };
+  const out = systems.onInteract(point.id, meta);
+  if (!out.ok) {
+    ui.showToast('已经完成过了', { ms: 1200 });
+    return;
+  }
+  audio.playClick();
+  ui.showToast(meta.toast || point.label, {
+    gold: point.id.includes('stele') || point.id === 'tide_step',
+    ms: 2400,
+  });
+  maybeNoteToasts(out.notes);
+
+  // Tide step: brief pulse on an untaken shard (flavour hint)
+  if (point.id === 'tide_step' && typeof shardField.pulseHint === 'function') {
+    const pulsed = shardField.pulseHint();
+    if (pulsed != null) {
+      // toast already covers flavour; avoid stacking unless needed
+    }
+  }
+
+  // Stele fragments → stele_join when all three done
+  if (point.id.startsWith('stele_frag_')) {
+    const f = systems.state.flags;
+    if (f.stele_frag_a && f.stele_frag_b && f.stele_frag_c && !f.stele_join) {
+      const joinMeta = INTERACT_META.stele_join;
+      const joinOut = systems.onInteract('stele_join', joinMeta);
+      if (joinOut.ok) {
+        ui.showToast(joinMeta.toast, { gold: true, ms: 2800 });
+        maybeNoteToasts(joinOut.notes);
+      }
+    }
+  }
+
+  // Lanterns (optional) → lanterns_all when harbor+court+summit lit
+  if (point.id.startsWith('lantern_')) {
+    landmarks.setLit?.(point.id, true);
+    const f = systems.state.flags;
+    if (
+      f.lantern_harbor &&
+      f.lantern_court &&
+      f.lantern_summit &&
+      !f.lanterns_all
+    ) {
+      const allMeta = INTERACT_META.lanterns_all;
+      const allOut = systems.onInteract('lanterns_all', allMeta);
+      if (allOut.ok) {
+        ui.showToast(allMeta.toast, { gold: true, ms: 3000 });
+        maybeNoteToasts(allOut.notes);
+      }
+    }
+  }
+
+  syncJournalUI();
+  persistPose();
+}
+
+// ── Input ─────────────────────────────────────────────────────────────
+const keys = { w: false, a: false, s: false, d: false };
+
+addEventListener('keydown', (e) => {
+  const c = e.code;
+  if (c === 'KeyW' || c === 'ArrowUp') keys.w = true;
+  if (c === 'KeyA' || c === 'ArrowLeft') keys.a = true;
+  if (c === 'KeyS' || c === 'ArrowDown') keys.s = true;
+  if (c === 'KeyD' || c === 'ArrowRight') keys.d = true;
+
+  if (c === 'KeyE') {
+    e.preventDefault();
+    tryInteractKey();
+  }
+  if (c === 'KeyJ' && (playing || won)) {
+    e.preventDefault();
+    const open = ui.toggleJournal();
+    if (open) audio.playJournalOpen?.();
+    else audio.playJournalClose?.();
+  }
+  if (c === 'KeyM') {
+    e.preventDefault();
+    const m = audio.toggleMute();
+    ui.setMuteLabel(m);
+    ui.showToast(m ? '音效已关闭' : '音效已开启', { ms: 1200 });
+  }
+});
+
+// Capture: Esc closes journal in ui.js first-listener order loses open state;
+// play close SFX here before ui's bubble handler flips isJournalOpen.
+addEventListener('keydown', (e) => {
+  if (e.code !== 'Escape') return;
+  if (ui.isJournalOpen?.()) audio.playJournalClose?.();
+}, true);
+
+addEventListener('keyup', (e) => {
+  const c = e.code;
+  if (c === 'KeyW' || c === 'ArrowUp') keys.w = false;
+  if (c === 'KeyA' || c === 'ArrowLeft') keys.a = false;
+  if (c === 'KeyS' || c === 'ArrowDown') keys.s = false;
+  if (c === 'KeyD' || c === 'ArrowRight') keys.d = false;
+});
+
+player.controls.addEventListener('unlock', () => {
+  if (playing && !won) {
+    persistPose();
+  }
+});
+
+// Pointer unlock mid-play → lightweight resume bar (not a full overlay)
+document.addEventListener('pointerlockchange', () => {
+  const locked = !!document.pointerLockElement;
+  const startUp = ui.els?.start && !ui.els.start.classList.contains('hidden');
+  const endUp = ui.els?.end && !ui.els.end.classList.contains('hidden');
+  // Guard: never show resume strip over start/end overlays
+  if (playing && !won && !locked && !startUp && !endUp) {
+    ui.showResumeHint?.('点击画面继续');
+  } else {
+    ui.hideResumeHint?.();
+  }
+});
+
+canvas.addEventListener('click', () => {
+  if (playing && !won && !player.controls.isLocked) {
+    audio.resume();
+    player.lock();
+  }
+});
+
+ui.els.btnStart?.addEventListener('click', () => beginPlay({ resume: false }));
+ui.els.btnContinue?.addEventListener('click', () => beginPlay({ resume: true }));
+ui.els.btnReplay?.addEventListener('click', () => {
+  systems.reset();
+  lore.resetReads?.();
+  applyTakenShards();
+  syncGates({ announce: false });
+  summitPads.setCompleted(false);
+  summitPads.resetAttempt();
+  player.reset({ x: 0, y: 2.2, z: 18 });
+  beginPlay({ resume: false });
+});
+ui.els.btnMute?.addEventListener('click', () => {
+  const m = audio.toggleMute();
+  ui.setMuteLabel(m);
+  ui.showToast(m ? '音效已关闭' : '音效已开启', { ms: 1100 });
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  postfx.setSize(innerWidth, innerHeight);
+});
+
+// ── Boot UI ───────────────────────────────────────────────────────────
+syncJournalUI();
+ui.showStart({ hasSave: hasSave() });
+ui.setMuteLabel(false);
+
+ui.els.journalBackdrop?.addEventListener('click', () => {
+  audio.playJournalClose?.();
+});
+
+// ── Loop ──────────────────────────────────────────────────────────────
+const clock = new THREE.Clock();
+
+function minimapPayload() {
+  const pos = player.getPosition();
+  const zones = (world.zones || []).map((z) => ({
+    name: z.name,
+    cx: z.center?.x ?? z.cx ?? 0,
+    cz: z.center?.z ?? z.cz ?? 0,
+    r: z.radius ?? z.r ?? 10,
+    color:
+      z.id === 'harbor'
+        ? 'rgba(45,180,212,0.18)'
+        : z.id === 'courtyard'
+          ? 'rgba(240,212,138,0.14)'
+          : z.id === 'summit'
+            ? 'rgba(160,120,255,0.16)'
+            : z.id === 'mosswalk'
+              ? 'rgba(90,180,130,0.18)'
+              : 'rgba(45,212,191,0.12)',
+  }));
+  const shards = shardField.shards.map((s) => ({
+    x: s.position.x,
+    z: s.position.z,
+    taken: !!s.userData.taken,
+  }));
+  const portalObj = world.portal;
+  const portal = portalObj
+    ? { x: portalObj.position.x, z: portalObj.position.z }
+    : { x: 0, z: 0 };
+  return {
+    player: { x: pos.x, z: pos.z, yaw: player.getYaw?.() ?? camera.rotation.y },
+    shards,
+    zones,
+    portal,
+    worldRadius: world.islandRadius ?? 40,
+  };
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  world.update(t, dt);
+  landmarks.update?.(t, dt);
+  shardField.update(t);
+  lore.update?.(t, dt);
+  gate.update?.(t, dt);
+  summitGate.update?.(t, dt);
+
+  if (playing && !won) {
+    const journalOpen = document.body.classList.contains('journal-open');
+    player.update(dt, keys);
+    if (!journalOpen) {
+      tryCollect();
+      // Soft footstep when moving under pointer lock (audio self-throttles)
+      if (
+        player.controls.isLocked &&
+        (keys.w || keys.a || keys.s || keys.d) &&
+        typeof audio.playFootstep === 'function'
+      ) {
+        audio.playFootstep();
+      }
+    }
+    const pos = player.getPosition();
+    const z = zoneAt(pos);
+    if (z) {
+      ui.setZoneName(z.name);
+      const entered = systems.onZoneEnter?.(z.id);
+      if (entered?.toast) {
+        ui.showToast(entered.toast, { ms: 2600 });
+        syncJournalUI();
+      }
+    }
+
+    // Optional summit pads — flavour only, does not gate portal / win
+    if (!systems.state.flags.star_align) {
+      const pev = summitPads.update(pos, t);
+      if (pev?.type === 'arm' || pev?.type === 'step') {
+        ui.showToast(`星井踏印 ${pev.count}/${pev.total}`, { ms: 1400 });
+        audio.playClick?.();
+      } else if (pev?.type === 'fail') {
+        ui.showToast('星印消散 —— 再试一次（十二息内踏满三枚）', { ms: 2000 });
+      } else if (pev?.type === 'complete') {
+        const meta = INTERACT_META.star_align;
+        const out = systems.onInteract('star_align', meta);
+        if (out.ok) {
+          audio.playClick?.();
+          ui.showToast(meta.toast, { gold: true, ms: 2800 });
+          maybeNoteToasts(out.notes);
+          syncJournalUI();
+          persistPose();
+        }
+        summitPads.setCompleted(true);
+      }
+    } else {
+      summitPads.update(pos, t);
+    }
+
+    let prompt = interact.nearbyPrompt(pos);
+    if (!prompt) {
+      const pp = summitPads.nearbyPrompt?.(pos, t);
+      if (pp) prompt = pp;
+    }
+    if (!prompt && lore.nearbyPrompt) {
+      const lp = lore.nearbyPrompt(pos);
+      if (lp) prompt = lp.includes('按 E') ? lp : `按 E · ${lp}`;
+    }
+    setInteractHint(prompt);
+
+    const pObj = world.portal;
+    const pox = pObj ? pObj.position.x : 0;
+    const poz = pObj ? pObj.position.z : 0;
+    const distPortal = Math.hypot(pos.x - pox, pos.z - poz);
+    if (distPortal < 5 && systems.state.collected >= Math.ceil(TOTAL * 0.6)) {
+      if (!animate._lastPulse || t - animate._lastPulse > 3.2) {
+        animate._lastPulse = t;
+        audio.playPortalPulse?.();
+      }
+    }
+
+    poseSaveAcc += dt;
+    if (poseSaveAcc >= SAVE_POSE_EVERY) {
+      poseSaveAcc = 0;
+      persistPose();
+    }
+  } else {
+    setInteractHint(null);
+  }
+
+  if (ui.els.hud?.classList.contains('visible')) {
+    ui.drawMinimap(minimapPayload());
+  }
+
+  postfx.render();
+}
+
+animate();
+  </script>
+</body>
+</html>
